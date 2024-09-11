@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Annotator CloudFormation stack.
+
+Parameters:
+  PublicKeyMaterial:
+    Description: The public key material (e.g., contents of ~/.ssh/id_ed25519.pub)
+    Type: String
+    NoEcho: true
+  KeyPairName:
+    Description: Name for the EC2 Key Pair
+    Type: String
+    Default: mqm-scorecard-key
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.nano
+      - t4g.micro
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t4g.xlarge
+      - t4g.2xlarge
+  AvailabilityZone1:
+    Description: Availability Zone for the first public subnet
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-2a
+  AvailabilityZone2:
+    Description: Availability Zone for the second public subnet
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-2b
+  AlarmEmail:
+    Description: Optional email for log alert notifications (leave blank to skip subscription)
+    Type: String
+    Default: ''
+
+Mappings:
+  AWSAMIRegionMap:
+    us-east-2:
+      arm64: ami-0ae6f07ad3a8ef182
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Name
+          Value: Main VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Main Internet Gateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet 1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet 2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "allow-all-sg"
+      GroupDescription: "Allow all inbound and outbound traffic"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: allow_all
+
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Ref KeyPairName
+      PublicKeyMaterial: !Ref PublicKeyMaterial
+
+  EC2SecretsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+
+  SecretsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:DescribeSecret'
+            Resource: '*'
+      Roles:
+        - !Ref EC2SecretsRole
+
+  CWLogsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: "*"
+      Roles:
+        - !Ref EC2SecretsRole
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      InstanceProfileName: ec2_instance_profile
+      Roles:
+        - !Ref EC2SecretsRole
+
+  DockerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /docker/mqm
+      RetentionInDays: 14
+
+  ErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref DockerLogGroup
+      FilterPattern: '?ERROR ?Error ?error'
+      MetricTransformations:
+        - MetricNamespace: AppLogs
+          MetricName: ErrorCount
+          MetricValue: '1'
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: docker-log-alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref AlarmEmail
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: docker-log-errors
+      AlarmDescription: Triggers when application logs contain ERRORs
+      Namespace: AppLogs
+      MetricName: ErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  EC2StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ec2-status-check-failed
+      AlarmDescription: Triggers if the instance has status check failures
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [AWSAMIRegionMap, !Ref "AWS::Region", arm64]
+      KeyName: !Ref KeyPairName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref InstanceSecurityGroup
+          SubnetId: !Ref PublicSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          runcmd:
+            - apt-get remove -y docker docker-engine docker.io containerd runc || true
+            - apt-get update
+            - apt-get install -y ca-certificates curl gnupg lsb-release
+            - mkdir -p /etc/apt/keyrings
+            - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            - apt-get update
+            - apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            - usermod -aG docker ubuntu
+            - mkdir -p /etc/docker
+            - cat >/etc/docker/daemon.json <<'EOF'
+              {
+                "log-driver": "awslogs",
+                "log-opts": {
+                  "awslogs-region": "${AWS::Region}",
+                  "awslogs-group": "/docker/mqm"
+                }
+              }
+              EOF
+            - systemctl enable docker
+            - systemctl restart docker
+
+            - /usr/bin/aws --region ${AWS::Region} logs create-log-group --log-group-name /docker/mqm || true
+      Tags:
+        - Key: Name
+          Value: MQM Scorecard Instance
+
+Outputs:
+  InstanceId:
+    Value: !Ref EC2Instance
+  PublicIP:
+    Value: !GetAtt EC2Instance.PublicIp
+  InstanceARN:
+    Value: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${EC2Instance}
+  LogErrorAlarmName:
+    Value: !Ref ErrorAlarm
+  DockerLogGroupName:
+    Description: Generated Log Group Name
+    Value: !Ref DockerLogGroup
