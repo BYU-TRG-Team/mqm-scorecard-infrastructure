@@ -154,6 +154,7 @@ Resources:
   SecretsPolicy:
     Type: AWS::IAM::Policy
     Properties:
+      PolicyName: secrets_policy
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -168,6 +169,7 @@ Resources:
   CWLogsPolicy:
     Type: AWS::IAM::Policy
     Properties:
+      PolicyName: annotator_cw_logs
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -272,30 +274,31 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #cloud-config
+          write_files:
+            - path: /etc/docker/daemon.json
+              owner: root:root
+              permissions: '0644'
+              content: |
+                {
+                  "log-driver": "awslogs",
+                  "log-opts": {
+                    "awslogs-region": "us-east-2",
+                    "awslogs-group": "/docker/mqm"
+                  }
+                }
           runcmd:
             - apt-get remove -y docker docker-engine docker.io containerd runc || true
             - apt-get update
-            - apt-get install -y ca-certificates curl gnupg lsb-release
+            - apt-get install -y ca-certificates curl gnupg lsb-release awscli
             - mkdir -p /etc/apt/keyrings
             - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-            - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            - bash -lc 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list'
             - apt-get update
             - apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
             - usermod -aG docker ubuntu
-            - mkdir -p /etc/docker
-            - cat >/etc/docker/daemon.json <<'EOF'
-              {
-                "log-driver": "awslogs",
-                "log-opts": {
-                  "awslogs-region": "${AWS::Region}",
-                  "awslogs-group": "/docker/mqm"
-                }
-              }
-              EOF
             - systemctl enable docker
             - systemctl restart docker
-
-            - /usr/bin/aws --region ${AWS::Region} logs create-log-group --log-group-name /docker/mqm || true
+            - aws --region us-east-2 logs create-log-group --log-group-name /docker/mqm || true
       Tags:
         - Key: Name
           Value: MQM Scorecard Instance
